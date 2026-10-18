@@ -1,0 +1,17 @@
+# ASR - Speech Recognition
+faster-whisper==1.2.1
+av==16.0.1
+ctranslate2==4.8.3
+
+# Translation - English to Traditional Chinese
+transformers==5.20.1
+torch==2.14.1
+sentencepiece==0.2.2
+sacremoses==0.2.0
+
+# Hugging Face Model Download
+huggingface-hub==2.2.0
+
+# Common Dependencies
+numpy==2.5.4
+tokenizers==0.23.3
