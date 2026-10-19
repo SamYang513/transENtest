@@ -191,7 +191,7 @@ hf download agentlans/en-zhtw --local-dir models/en-zhtw
 執行：
 
 ```powershell
-python asr_translate.py test272.wav
+python asr_translate.py test.wav
 ```
 
 流程：
@@ -207,10 +207,10 @@ python asr_translate.py test272.wav
 
 ```text
 output/
-├── test272_raw_en.txt
-├── test272_en.txt
-├── test272_zh_tw.txt
-└── test272_result.json
+├── test_raw_en.txt
+├── test_en.txt
+├── test_zh_tw.txt
+└── test_result.json
 ```
 
 ### 方式 B：只執行英文語音辨識
@@ -218,7 +218,7 @@ output/
 執行：
 
 ```powershell
-python asr_only.py test272.wav
+python asr_only.py test.wav
 ```
 
 流程：
@@ -232,9 +232,9 @@ python asr_only.py test272.wav
 
 ```text
 output/
-├── test272_raw_en.txt
-├── test272_en.txt
-└── test272_asr.json
+├── test_raw_en.txt
+├── test_en.txt
+└── test_asr.json
 ```
 
 其中：
@@ -246,7 +246,7 @@ output/
 若不希望合併片段：
 
 ```powershell
-python asr_only.py test272.wav --no-merge
+python asr_only.py test.wav --no-merge
 ```
 
 ### 方式 C：只執行英文翻譯
@@ -254,13 +254,13 @@ python asr_only.py test272.wav --no-merge
 建議使用上一階段產生的 JSON：
 
 ```powershell
-python translate_only.py output/test272_asr.json
+python translate_only.py output/test_asr.json
 ```
 
 也可以讀取英文 TXT：
 
 ```powershell
-python translate_only.py output/test272_en.txt
+python translate_only.py output/test_en.txt
 ```
 
 流程：
@@ -274,8 +274,8 @@ python translate_only.py output/test272_en.txt
 
 ```text
 output/
-├── test272_zh_tw.txt
-└── test272_result.json
+├── test_zh_tw.txt
+└── test_result.json
 ```
 
 使用 JSON 作為輸入，可以保留原始的
@@ -290,13 +290,13 @@ output/
 第一步：
 
 ```powershell
-python asr_only.py test272.wav
+python asr_only.py test.wav
 ```
 
 第二步：
 
 ```powershell
-python translate_only.py output/test272_asr.json
+python translate_only.py output/test_asr.json
 ```
 
 這樣不需要在翻譯階段重新執行 Whisper。
@@ -308,17 +308,17 @@ python translate_only.py output/test272_asr.json
 指定 CPU：
 
 ```powershell
-python asr_translate.py test272.wav --device cpu
-python asr_only.py test272.wav --device cpu
-python translate_only.py output/test272_asr.json --device cpu
+python asr_translate.py test.wav --device cpu
+python asr_only.py test.wav --device cpu
+python translate_only.py output/test_asr.json --device cpu
 ```
 
 指定 GPU：
 
 ```powershell
-python asr_translate.py test272.wav --device cuda
-python asr_only.py test272.wav --device cuda
-python translate_only.py output/test272_asr.json --device cuda
+python asr_translate.py test.wav --device cuda
+python asr_only.py test.wav --device cuda
+python translate_only.py output/test_asr.json --device cuda
 ```
 
 注意：
