@@ -1,6 +1,7 @@
 
 import argparse
 import json
+import re
 import time
 from pathlib import Path
 
@@ -9,52 +10,44 @@ from faster_whisper import WhisperModel
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 
 
-# ==========================================
-# 1. 專案路徑設定
-# ==========================================
-
 BASE_DIR = Path(__file__).resolve().parent
 
 ASR_MODEL_PATH = BASE_DIR / "models" / "faster-whisper-medium"
 TRANSLATE_MODEL_PATH = BASE_DIR / "models" / "en-zhtw"
 OUTPUT_DIR = BASE_DIR / "output"
 
+# Baseline A
+ASR_BEAM_SIZE = 5
+TRANSLATE_NUM_BEAMS = 4
+TRANSLATE_LENGTH_PENALTY = 1.0
+TRANSLATE_REPETITION_PENALTY = 1.0
+TRANSLATE_MAX_NEW_TOKENS = 256
 
-# ==========================================
-# 2. 載入模型
-# ==========================================
+MERGE_MAX_CHARS = 300
+MERGE_MAX_GAP = 1.5
 
-def load_models(device="cpu"):
 
+def load_asr_model(device="cpu"):
     if not ASR_MODEL_PATH.is_dir():
         raise FileNotFoundError(
             f"找不到 ASR 模型：{ASR_MODEL_PATH}"
         )
 
+    return WhisperModel(
+        str(ASR_MODEL_PATH),
+        device=device,
+        compute_type="int8"
+    )
+
+
+def load_translation_model(device="cpu"):
     if not TRANSLATE_MODEL_PATH.is_dir():
         raise FileNotFoundError(
             f"找不到翻譯模型：{TRANSLATE_MODEL_PATH}"
         )
 
     if device == "cuda" and not torch.cuda.is_available():
-        raise RuntimeError(
-            "PyTorch 無法使用 CUDA，請改用 --device cpu"
-        )
-
-    print("\n========== 載入模型 ==========")
-
-    start = time.perf_counter()
-
-    print("[1/2] 載入 faster-whisper-medium...")
-
-    asr_model = WhisperModel(
-        str(ASR_MODEL_PATH),
-        device=device,
-        compute_type="float16" if device == "cuda" else "int8",
-        local_files_only=True
-    )
-
-    print("[2/2] 載入 en-zhtw 翻譯模型...")
+        raise RuntimeError("PyTorch 無法使用 CUDA")
 
     tokenizer = AutoTokenizer.from_pretrained(
         str(TRANSLATE_MODEL_PATH),
@@ -69,19 +62,102 @@ def load_models(device="cpu"):
     translator = translator.to(device)
     translator.eval()
 
-    elapsed = time.perf_counter() - start
-
-    print(f"模型載入完成，耗時：{elapsed:.2f} 秒")
-
-    return asr_model, tokenizer, translator
+    return tokenizer, translator
 
 
-# ==========================================
-# 3. 英文翻譯繁體中文
-# ==========================================
+def transcribe_audio(audio_path, asr_model):
+    segments, info = asr_model.transcribe(
+        str(audio_path),
+        language="en",
+        beam_size=ASR_BEAM_SIZE,
+        vad_filter=False
+    )
+
+    results = []
+
+    for index, segment in enumerate(segments, start=1):
+        text = segment.text.strip()
+
+        if not text:
+            continue
+
+        results.append({
+            "id": index,
+            "start": round(segment.start, 2),
+            "end": round(segment.end, 2),
+            "english_text": text
+        })
+
+        print(
+            f"[{segment.start:.2f} - {segment.end:.2f}] "
+            f"{text}"
+        )
+
+    return results, info
+
+
+def merge_asr_segments(
+    segments,
+    max_chars=MERGE_MAX_CHARS,
+    max_gap=MERGE_MAX_GAP
+):
+    if not segments:
+        return []
+
+    merged = []
+    current = None
+
+    for segment in segments:
+        text = segment["english_text"].strip()
+
+        if current is None:
+            current = {
+                "start": segment["start"],
+                "end": segment["end"],
+                "english_text": text,
+                "source_segment_ids": [segment["id"]]
+            }
+            continue
+
+        gap = segment["start"] - current["end"]
+
+        previous_ends_sentence = bool(
+            re.search(r'[.!?]["\']?$', current["english_text"])
+        )
+
+        would_exceed_length = (
+            len(current["english_text"]) + len(text) + 1
+            > max_chars
+        )
+
+        if (
+            previous_ends_sentence
+            or gap > max_gap
+            or would_exceed_length
+        ):
+            merged.append(current)
+
+            current = {
+                "start": segment["start"],
+                "end": segment["end"],
+                "english_text": text,
+                "source_segment_ids": [segment["id"]]
+            }
+        else:
+            current["english_text"] += " " + text
+            current["end"] = segment["end"]
+            current["source_segment_ids"].append(segment["id"])
+
+    if current is not None:
+        merged.append(current)
+
+    for index, item in enumerate(merged, start=1):
+        item["id"] = index
+
+    return merged
+
 
 def translate_text(text, tokenizer, translator):
-
     if not text.strip():
         return ""
 
@@ -92,63 +168,140 @@ def translate_text(text, tokenizer, translator):
         max_length=256
     )
 
-    # 將輸入移至翻譯模型所在裝置
     device = next(translator.parameters()).device
+
     inputs = {
         key: value.to(device)
         for key, value in inputs.items()
     }
 
+    # 保留 Baseline A 原始 generate() 行為。
+    # 不修改 generation_config。
+    # Transformers 的長度設定警告可以保留。
     with torch.inference_mode():
         outputs = translator.generate(
             **inputs,
-            max_new_tokens=256,
-            num_beams=4
+            num_beams=TRANSLATE_NUM_BEAMS,
+            length_penalty=TRANSLATE_LENGTH_PENALTY,
+            repetition_penalty=TRANSLATE_REPETITION_PENALTY,
+            max_new_tokens=TRANSLATE_MAX_NEW_TOKENS,
+            do_sample=False
         )
 
-    translated = tokenizer.decode(
+    return tokenizer.decode(
         outputs[0],
         skip_special_tokens=True
-    )
-
-    return translated
+    ).strip()
 
 
-# ==========================================
-# 4. ASR 語音辨識與翻譯
-# ==========================================
-
-def process_audio(
+def save_results(
     audio_path,
-    asr_model,
-    tokenizer,
-    translator
+    raw_segments,
+    translated_segments,
+    elapsed_seconds,
+    device
 ):
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    print("\n========== 開始處理音訊 ==========")
-    print(f"音訊檔案：{audio_path.name}")
+    name = audio_path.stem
+
+    raw_path = OUTPUT_DIR / f"{name}_raw_en.txt"
+    english_path = OUTPUT_DIR / f"{name}_en.txt"
+    chinese_path = OUTPUT_DIR / f"{name}_zh_tw.txt"
+    json_path = OUTPUT_DIR / f"{name}_result.json"
+
+    with open(raw_path, "w", encoding="utf-8") as f:
+        for item in raw_segments:
+            f.write(
+                f"[{item['start']:.2f} - {item['end']:.2f}] "
+                f"{item['english_text']}\n"
+            )
+
+    with open(english_path, "w", encoding="utf-8") as f:
+        for item in translated_segments:
+            f.write(
+                f"[{item['start']:.2f} - {item['end']:.2f}] "
+                f"{item['english_text']}\n"
+            )
+
+    with open(chinese_path, "w", encoding="utf-8") as f:
+        for item in translated_segments:
+            f.write(
+                f"[{item['start']:.2f} - {item['end']:.2f}] "
+                f"{item['translated_text']}\n"
+            )
+
+    result = {
+        "audio_file": audio_path.name,
+        "language": "en",
+        "target_language": "zh-TW",
+        "device": device,
+        "asr_model": "faster-whisper-medium",
+        "translation_model": "agentlans/en-zhtw",
+        "generation_config": {
+            "num_beams": TRANSLATE_NUM_BEAMS,
+            "length_penalty": TRANSLATE_LENGTH_PENALTY,
+            "repetition_penalty": TRANSLATE_REPETITION_PENALTY,
+            "max_new_tokens": TRANSLATE_MAX_NEW_TOKENS,
+            "do_sample": False
+        },
+        "raw_segment_count": len(raw_segments),
+        "segment_count": len(translated_segments),
+        "processing_seconds": round(elapsed_seconds, 2),
+        "segments": translated_segments
+    }
+
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(result, f, ensure_ascii=False, indent=2)
+
+    print("\n========== 輸出完成 ==========")
+    print(f"原始英文：{raw_path}")
+    print(f"合併英文：{english_path}")
+    print(f"繁體中文：{chinese_path}")
+    print(f"JSON：{json_path}")
+
+
+def process_audio(audio_path, device="cpu", merge=True):
+    audio_path = Path(audio_path).resolve()
+
+    if not audio_path.is_file():
+        raise FileNotFoundError(f"找不到音檔：{audio_path}")
 
     start_time = time.perf_counter()
 
-    segments, info = asr_model.transcribe(
-        str(audio_path),
-        language="en",
-        task="transcribe",
-        beam_size=5,
-        vad_filter=True
-    )
+    print("========== ASR + Translation ==========")
+    print(f"音檔：{audio_path.name}")
+    print(f"裝置：{device}")
 
-    print("辨識語言：英文")
+    print("\n[1/4] 載入 ASR 模型...")
+    asr_model = load_asr_model(device)
 
-    results = []
+    print("[2/4] 載入翻譯模型...")
+    tokenizer, translator = load_translation_model(device)
 
-    # 逐段辨識與翻譯
-    for index, segment in enumerate(segments, start=1):
+    print("[3/4] 開始英文語音辨識...")
+    raw_segments, info = transcribe_audio(audio_path, asr_model)
 
-        english = segment.text.strip()
+    if merge:
+        segments = merge_asr_segments(raw_segments)
+    else:
+        segments = [
+            {
+                **item,
+                "source_segment_ids": [item["id"]]
+            }
+            for item in raw_segments
+        ]
 
-        if not english:
-            continue
+    for index, item in enumerate(segments, start=1):
+        item["id"] = index
+
+    print("\n[4/4] 開始繁體中文翻譯...")
+
+    translated_segments = []
+
+    for index, item in enumerate(segments, start=1):
+        english = item["english_text"]
 
         chinese = translate_text(
             english,
@@ -156,154 +309,56 @@ def process_audio(
             translator
         )
 
-        item = {
-            "id": index,
-            "start": round(segment.start, 2),
-            "end": round(segment.end, 2),
-            "english_text": english,
+        result = {
+            **item,
             "translated_text": chinese
         }
 
-        results.append(item)
+        translated_segments.append(result)
 
-        print(f"\n========== Segment {index} ==========")
-        print(
-            f"時間：{segment.start:.2f}s "
-            f"-> {segment.end:.2f}s"
-        )
-        print(f"英文：{english}")
-        print(f"繁中：{chinese}")
+        print(f"\n[{index}/{len(segments)}]")
+        print(f"EN: {english}")
+        print(f"ZH: {chinese}")
 
-    elapsed = time.perf_counter() - start_time
+    elapsed_seconds = time.perf_counter() - start_time
 
-    print("\n========== 處理完成 ==========")
-    print(f"總處理時間：{elapsed:.2f} 秒")
-    print(f"總片段數：{len(results)}")
-
-    return results, elapsed
-
-
-# ==========================================
-# 5. 儲存 TXT 與 JSON
-# ==========================================
-
-def save_results(audio_path, results, elapsed):
-
-    OUTPUT_DIR.mkdir(
-        parents=True,
-        exist_ok=True
+    save_results(
+        audio_path,
+        raw_segments,
+        translated_segments,
+        elapsed_seconds,
+        device
     )
 
-    english_file = (
-        OUTPUT_DIR / f"{audio_path.stem}_en.txt"
-    )
+    print(f"\n總執行時間：{elapsed_seconds:.2f} 秒")
 
-    chinese_file = (
-        OUTPUT_DIR / f"{audio_path.stem}_zhtw.txt"
-    )
+    return translated_segments
 
-    json_file = (
-        OUTPUT_DIR / f"{audio_path.stem}_result.json"
-    )
-
-    english_lines = []
-    chinese_lines = []
-
-    for item in results:
-
-        timestamp = (
-            f"[{item['start']:.2f}s "
-            f"-> {item['end']:.2f}s]"
-        )
-
-        english_lines.append(
-            f"{timestamp} {item['english_text']}"
-        )
-
-        chinese_lines.append(
-            f"{timestamp} {item['translated_text']}"
-        )
-
-    english_file.write_text(
-        "\n".join(english_lines),
-        encoding="utf-8-sig"
-    )
-
-    chinese_file.write_text(
-        "\n".join(chinese_lines),
-        encoding="utf-8-sig"
-    )
-
-    json_data = {
-        "audio_file": audio_path.name,
-        "asr_model": "Systran/faster-whisper-medium",
-        "translation_model": "agentlans/en-zhtw",
-        "source_language": "en",
-        "target_language": "zh-TW",
-        "processing_time_seconds": round(elapsed, 2),
-        "segments": results
-    }
-
-    json_file.write_text(
-        json.dumps(
-            json_data,
-            ensure_ascii=False,
-            indent=4
-        ),
-        encoding="utf-8"
-    )
-
-    print("\n========== 輸出檔案 ==========")
-    print(f"英文逐字稿：{english_file}")
-    print(f"繁中翻譯：{chinese_file}")
-    print(f"JSON 結果：{json_file}")
-
-
-# ==========================================
-# 6. 主程式
-# ==========================================
 
 def main():
-
     parser = argparse.ArgumentParser(
-        description="英文 ASR + 繁體中文翻譯系統"
+        description="英文 ASR + 繁體中文翻譯"
     )
 
-    parser.add_argument(
-        "audio",
-        help="音訊檔案路徑，例如 test.wav"
-    )
+    parser.add_argument("audio", type=str)
 
     parser.add_argument(
         "--device",
         choices=["cpu", "cuda"],
-        default="cpu",
-        help="執行裝置，預設 cpu"
+        default="cpu"
+    )
+
+    parser.add_argument(
+        "--no-merge",
+        action="store_true"
     )
 
     args = parser.parse_args()
 
-    audio_path = Path(args.audio).resolve()
-
-    if not audio_path.is_file():
-        print(f"錯誤：找不到音訊檔案 {audio_path}")
-        return
-
-    asr_model, tokenizer, translator = load_models(
-        device=args.device
-    )
-
-    results, elapsed = process_audio(
-        audio_path,
-        asr_model,
-        tokenizer,
-        translator
-    )
-
-    save_results(
-        audio_path,
-        results,
-        elapsed
+    process_audio(
+        audio_path=args.audio,
+        device=args.device,
+        merge=not args.no_merge
     )
 
 
